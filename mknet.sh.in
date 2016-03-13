@@ -1,0 +1,293 @@
+#!/bin/sh
+#
+# vim: set ts=4 sw=4 et:
+#
+#-
+# Copyright (c) 2009-2015 Juan Romero Pardines.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#-
+trap "error_out $LINENO $?" INT TERM 0
+
+readonly REQUIRED_PKGS="base-files libgcc dash coreutils sed tar gawk syslinux squashfs-tools"
+readonly INITRAMFS_PKGS="binutils xz device-mapper dracut-network dhclient"
+readonly PROGNAME=$(basename $0)
+
+info_msg() {
+    printf "\033[1m$@\n\033[m"
+}
+die() {
+    info_msg "ERROR: $@"
+    error_out 1
+}
+print_step() {
+    CURRENT_STEP=$((CURRENT_STEP+1))
+    info_msg "[${CURRENT_STEP}/${STEP_COUNT}] $@"
+}
+mount_pseudofs() {
+    for f in sys dev proc; do
+        mkdir -p $ROOTFS/$f
+        mount --bind /$f $ROOTFS/$f
+    done
+}
+umount_pseudofs() {
+    umount -f $ROOTFS/sys >/dev/null 2>&1
+    umount -f $ROOTFS/dev >/dev/null 2>&1
+    umount -f $ROOTFS/proc >/dev/null 2>&1
+}
+error_out() {
+    umount_pseudofs
+    [ -d "$BUILDDIR" -a -z "$KEEP_BUILDDIR" ] && rm -rf "$BUILDDIR"
+    exit ${1:=0}
+}
+
+usage() {
+    cat <<_EOF
+Usage: $PROGNAME [options]
+
+Options:
+ -a <xbps-arch>     Set XBPS_ARCH (do not use it unless you know what it is)
+ -b <system-pkg>    Set an alternative base-system package (defaults to base-system).
+ -r <repo-url>      Use this XBPS repository (may be specified multiple times).
+ -c <cachedir>      Use this XBPS cache directory (/var/cache/xbps if unset).
+ -k <keymap>        Default keymap to use (us if unset)
+ -l <locale>        Default locale to use (en_US.UTF-8 if unset).
+ -i <lz4|gzip|bzip2|xz> Compression type for the initramfs image (lz4 if unset).
+ -o <file>          Output file name for the netboot tarball (auto if unset).
+
+ -C "cmdline args"  Add additional kernel command line arguments.
+ -T "title"         Modify the bootloader title.
+ -K                 Do not remove builddir.
+
+The $PROGNAME script generates a network-bootable tarball of Void Linux
+This *.tar.gz contains only the autoinstaller.
+_EOF
+    exit 1
+}
+
+copy_void_keys() {
+    mkdir -p "$1"/var/db/xbps/keys
+    cp keys/*.plist "$1"/var/db/xbps/keys
+}
+
+copy_void_conf() {
+    install -Dm644 data/void-vpkgs.conf "$1"/usr/share/xbps.d/void-virtualpkgs.conf
+}
+
+copy_autoinstaller_files() {
+    mkdir -p $1/usr/lib/dracut/modules.d/01autoinstaller
+    cp autoinstaller/* $1/usr/lib/dracut/modules.d/01autoinstaller/
+}
+
+install_prereqs() {
+    copy_void_conf $VOIDHOSTDIR
+    XBPS_ARCH=$ARCH $XBPS_INSTALL_CMD -r $VOIDHOSTDIR $XBPS_REPOSITORY \
+        $XBPS_HOST_CACHEDIR -y ${REQUIRED_PKGS}
+    [ $? -ne 0 ] && die "Failed to install required software, exiting..."
+}
+
+install_packages() {
+    copy_void_conf $ROOTFS
+
+    XBPS_ARCH=$BASE_ARCH ${XBPS_INSTALL_CMD} -r $ROOTFS \
+        $XBPS_REPOSITORY $XBPS_CACHEDIR -yn ${PACKAGE_LIST} ${INITRAMFS_PKGS}
+    [ $? -ne 0 ] && die "Missing required binary packages, exiting..."
+
+    mount_pseudofs
+
+    LANG=C XBPS_ARCH=$BASE_ARCH ${XBPS_INSTALL_CMD} -U -r $ROOTFS \
+        $XBPS_REPOSITORY $XBPS_CACHEDIR -y ${PACKAGE_LIST} ${INITRAMFS_PKGS}
+    [ $? -ne 0 ] && die "Failed to install $PACKAGE_LIST"
+
+    xbps-reconfigure -r $ROOTFS -f base-files >/dev/null 2>&1
+    chroot $ROOTFS env -i xbps-reconfigure -f base-files
+
+    # Enable choosen UTF-8 locale and generate it into the target rootfs.
+    if [ -f $ROOTFS/etc/default/libc-locales ]; then
+        sed -e "s/\#\(${LOCALE}.*\)/\1/g" -i $ROOTFS/etc/default/libc-locales
+    fi
+    chroot $ROOTFS env -i xbps-reconfigure -a
+
+    if [ -x installer.sh ]; then
+        install -Dm755 installer.sh $ROOTFS/usr/sbin/void-installer
+    else
+        install -Dm755 /usr/sbin/void-installer $ROOTFS/usr/sbin/void-installer
+    fi
+    # Cleanup and remove useless stuff.
+    rm -rf $ROOTFS/var/cache/* $ROOTFS/run/* $ROOTFS/var/run/*
+}
+
+copy_include_directory() {
+    find $INCLUDE_DIRECTORY -mindepth 1 -maxdepth 1 -exec cp -rfpPv {} $ROOTFS/ \;
+}
+
+generate_initramfs() {
+    local _args
+
+    copy_autoinstaller_files $ROOTFS
+    if [ "$BASE_SYSTEM_PKG" = "base-system-systemd" ]; then
+        _args="--add systemd"
+    else
+        _args="--omit systemd"
+    fi
+    chroot $ROOTFS env -i /usr/bin/dracut -N --${INITRAMFS_COMPRESSION} \
+        --add-drivers "ahci" --force-add "autoinstaller" ${_args} "/boot/initrd" $KERNELVERSION
+    [ $? -ne 0 ] && die "Failed to generate the initramfs"
+
+    mv $ROOTFS/boot/initrd $BOOT_DIR
+    cp $ROOTFS/boot/vmlinuz-$KERNELVERSION $BOOT_DIR/vmlinuz
+    chmod 0644 $BOOT_DIR/initrd
+}
+
+generate_pxelinux_boot() {
+    cp -f $SYSLINUX_DATADIR/pxelinux.0 "$BOOT_DIR"
+    cp -f $SYSLINUX_DATADIR/ldlinux.c32 "$BOOT_DIR"
+    cp -f $SYSLINUX_DATADIR/libcom32.c32 "$BOOT_DIR"
+    cp -f $SYSLINUX_DATADIR/vesamenu.c32 "$BOOT_DIR"
+    cp -f $SYSLINUX_DATADIR/libutil.c32 "$BOOT_DIR"
+    cp -f $SYSLINUX_DATADIR/chain.c32 "$BOOT_DIR"
+    cp -f pxelinux.cfg/pxelinux.cfg.in "$PXELINUX_DIR"/default
+    cp -f ${SPLASH_IMAGE} "$BOOT_DIR"
+
+    sed -i  -e "s|@@SPLASHIMAGE@@|$(basename ${SPLASH_IMAGE})|" \
+        -e "s|@@KERNVER@@|${KERNELVERSION}|" \
+        -e "s|@@KEYMAP@@|${KEYMAP}|" \
+        -e "s|@@ARCH@@|$BASE_ARCH|" \
+        -e "s|@@LOCALE@@|${LOCALE}|" \
+        -e "s|@@BOOT_TITLE@@|${BOOT_TITLE}|" \
+        -e "s|@@BOOT_CMDLINE@@|${BOOT_CMDLINE}|" \
+        $PXELINUX_DIR/default
+}
+
+generate_netboot_tarball() {
+    cd $IMAGEDIR/tftp
+    tar -zcvf $CURDIR/$OUTPUT_FILE.tar.gz .
+    cd $CURDIR
+}
+
+#
+# main()
+#
+while getopts "a:b:r:c:C:T:Kk:l:i:o:p:h" opt; do
+    case $opt in
+        a) BASE_ARCH="$OPTARG";;
+        b) BASE_SYSTEM_PKG="$OPTARG";;
+        r) XBPS_REPOSITORY="--repository=$OPTARG $XBPS_REPOSITORY";;
+        c) XBPS_CACHEDIR="--cachedir=$OPTARG";;
+        K) readonly KEEP_BUILDDIR=1;;
+        k) KEYMAP="$OPTARG";;
+        l) LOCALE="$OPTARG";;
+        i) INITRAMFS_COMPRESSION="$OPTARG";;
+        o) OUTPUT_FILE="$OPTARG";;
+        p) PACKAGE_LIST="$OPTARG";;
+        C) BOOT_CMDLINE="$OPTARG";;
+        T) BOOT_TITLE="$OPTARG";;
+        h) usage;;
+    esac
+done
+shift $((OPTIND - 1))
+
+XBPS_REPOSITORY="$XBPS_REPOSITORY --repository=http://repo.voidlinux.eu/current --repository=http://muslrepo.voidlinux.eu/current"
+
+ARCH=$(xbps-uhelper arch)
+
+# Set defaults
+: ${BASE_ARCH:=$(uname -m)}
+: ${XBPS_CACHEDIR:=-c $(pwd -P)/xbps-cachedir-${BASE_ARCH}}
+: ${XBPS_HOST_CACHEDIR:=-c $(pwd -P)/xbps-cachedir-${ARCH}}
+: ${KEYMAP:=us}
+: ${LOCALE:=en_US.UTF-8}
+: ${INITRAMFS_COMPRESSION:=xz}
+: ${SQUASHFS_COMPRESSION:=xz}
+: ${BASE_SYSTEM_PKG:=base-system}
+: ${BOOT_TITLE:="Void Linux"}
+
+# Required packages in the image for a working system.
+PACKAGE_LIST="$BASE_SYSTEM_PKG $PACKAGE_LIST"
+
+# Check for root permissions.
+if [ "$(id -u)" -ne 0 ]; then
+    die "Must be run as root, exiting..."
+fi
+
+readonly CURDIR="$PWD"
+
+ISO_VOLUME="VOID_LIVE"
+if [ -n "$ROOTDIR" ]; then
+    BUILDDIR=$(mktemp --tmpdir="$ROOTDIR" -d)
+else
+    BUILDDIR=$(mktemp --tmpdir="$(pwd -P)" -d)
+fi
+BUILDDIR=$(readlink -f $BUILDDIR)
+IMAGEDIR="$BUILDDIR/image"
+ROOTFS="$IMAGEDIR/rootfs"
+VOIDHOSTDIR="$BUILDDIR/void-host"
+BOOT_DIR="$IMAGEDIR/tftp"
+PXELINUX_DIR="$BOOT_DIR/pxelinux.cfg"
+PXELINUX_CFG="$PXELINUX_DIR/default"
+CURRENT_STEP=0
+STEP_COUNT=9
+[ -n "${INCLUDE_DIRECTORY}" ] && ((STEP_COUNT=STEP_COUNT+1))
+
+: ${SYSLINUX_DATADIR:=$VOIDHOSTDIR/usr/share/syslinux}
+: ${SPLASH_IMAGE:=data/splash.png}
+: ${XBPS_INSTALL_CMD:=xbps-install}
+: ${XBPS_REMOVE_CMD:=xbps-remove}
+: ${XBPS_QUERY_CMD:=xbps-query}
+: ${XBPS_RINDEX_CMD:=xbps-rindex}
+: ${XBPS_UHELPER_CMD:=xbps-uhelper}
+: ${XBPS_RECONFIGURE_CMD:=xbps-reconfigure}
+
+mkdir -p $ROOTFS $VOIDHOSTDIR $PXELINUX_DIR
+
+print_step "Synchronizing XBPS repository data..."
+copy_void_keys $ROOTFS
+copy_void_keys $VOIDHOSTDIR
+XBPS_ARCH=$BASE_ARCH $XBPS_INSTALL_CMD -r $ROOTFS ${XBPS_REPOSITORY} -S
+XBPS_ARCH=$ARCH $XBPS_INSTALL_CMD -r $VOIDHOSTDIR $XBPS_REPOSITORY -S
+
+_linux_series=$(XBPS_ARCH=$BASE_ARCH $XBPS_QUERY_CMD -r $ROOTFS ${XBPS_REPOSITORY:=-R} -x linux|head -1)
+_kver=$(XBPS_ARCH=$BASE_ARCH $XBPS_QUERY_CMD -r $ROOTFS ${XBPS_REPOSITORY:=-R} -p pkgver ${_linux_series})
+KERNELVERSION=$($XBPS_UHELPER_CMD getpkgversion ${_kver})
+
+: ${OUTPUT_FILE="void-netboot-${BASE_ARCH}-${KERNELVERSION}-$(date +%Y%m%d)"}
+
+print_step "Installing software to generate the image: ${REQUIRED_PKGS} ..."
+install_prereqs
+
+mkdir -p "$ROOTFS"/etc
+[ -s data/motd ] && cp data/motd $ROOTFS/etc
+[ -s data/issue ] && cp data/issue $ROOTFS/etc
+
+print_step "Installing void pkgs into the rootfs: ${PACKAGE_LIST} ..."
+install_packages
+
+print_step "Generating initramfs image ($INITRAMFS_COMPRESSION)..."
+generate_initramfs
+
+print_step "Generating pxelinux support..."
+generate_pxelinux_boot
+
+print_step "Generating netboot.tar.gz..."
+generate_netboot_tarball
+
+info_msg "Created $(readlink -f $CURDIR/$OUTPUT_FILE) ($hsize) successfully."

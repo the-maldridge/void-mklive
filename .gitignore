@@ -2,4 +2,5 @@
 *.img
 *.xz
 *.iso
+*.tar.gz
 xbps-cachedir*
