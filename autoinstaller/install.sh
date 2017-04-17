@@ -30,30 +30,273 @@ VAI_get_address() {
     dhcpcd -w -L --timeout 0
 }
 
-VAI_partition_disk() {
-    # Paritition Disk
-    sfdisk "${disk}" <<EOF
-,$bootpartitionsize
-,${swapsize}K
-;
-EOF
+VAI_partition_disks() {
+    local disk_vars="$(set | grep 'disk_' | awk 'BEGIN {FS="="}; { print $1 };' )";
+    local disks="$(echo "$disk_vars" | awk 'BEGIN {FS="_"}; { print $2 };' | sort | uniq)";
+    for disk in $disks
+    do
+        VAI_partition_disk "$disk_vars" "$disk";
+    done;
 }
 
-VAI_format_disk() {
-    # Make Filesystems
-    mkfs.ext4 -F "${disk}1"
-    mkfs.ext4 -F "${disk}3"
-    if [ "${swapsize}" -ne 0 ] ; then
-        mkswap -f "${disk}2"
+VAI_partition_disk() {
+    local disk_vars="$1";
+    local disk="$2";
+    local dev="$(eval "echo \$disk_${disk}_dev")";
+    if [ -z "$dev" ]; then
+        dev="$default_disk";
+        eval "disk_${disk}_dev=\$default_disk";
     fi
+
+    local table="$(eval "echo \$disk_${disk}_table")";
+    if [ -z "$table" ]; then
+        table="gpt";
+    fi;
+
+    local script="label: $table"$'\n'$'\n';
+    local partitions="$(echo "$disk_vars" | grep "disk_${disk}_partition" | awk 'BEGIN {FS="_"}; { print $4 };' | sort | uniq)";
+
+    for partition in $partitions
+    do
+        script="${script}"$'\n'"$(VAI_create_partition_script_line "$disk" "$partition" "$table")";
+    done
+
+    VAI_info_msg "Writing following script to $dev"
+    echo "$script";
+
+    echo "$script" | sfdisk "$dev";
+
+    for partition in $partitions
+    do
+        VAI_format_disk_partition "$disk" "$partition";
+    done
+}
+
+VAI_create_partition_script_line() {
+    local disk="$1";
+    local partition="$2";
+    local table="$3";
+    local partition_prefix="disk_${disk}_partition_${partition}";
+    local size="$(eval "echo \$${partition_prefix}_size")";
+    local type="$(eval "echo \$${partition_prefix}_type")";
+    local fs="$(eval "echo \$${partition_prefix}_fs")";
+    local line="";
+
+    if [ "$table" = "dos" ]; then
+        if [ "$type" = "efi" ]; then
+            type="ef";
+        elif [ "$type" = "swap" -o "$fs" = "swap" ]; then
+            type="82";
+        elif [ "$type" = "lvm" -o "$fs" = "lvm" ]; then
+            type="8e";
+        else
+            type="83"
+        fi;
+    else
+        if [ "$type" = "efi" ]; then
+            type="C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+        elif [ "$type" = "swap" ]; then
+            type="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F";
+        else
+            type="0FC63DAF-8483-4772-8E79-3D69D8477DE4";
+        fi;
+    fi;
+
+    if [ ! -z "$size" ]; then
+        line="${line}size=${size},";
+    fi
+
+    line="${line}type=${type},";
+
+    echo "${line}";
+}
+
+VAI_format_disk_partition() {
+    local disk="$1";
+    local partition="$2";
+    local partition_prefix="disk_${disk}_partition_${partition}";
+    local disk_dev="$(eval "echo \$disk_${disk}_dev")";
+    local dev="${disk_dev}${partition}";
+    local fs="$(eval "echo \$${partition_prefix}_fs")";
+    local label="$(eval "echo \$${partition_prefix}_label")";
+    local lvm="$(eval "echo \$${partition_prefix}_lvm")";
+    local luks="$(eval "echo \$${partition_prefix}_luks")";
+
+    VAI_format_partition "${fs}" "${dev}" "${label}" "${lvm}" "${luks}";
+}
+
+VAI_format_partition() {
+    local fs="$1";
+    local dev="$2";
+    local label="$3";
+    local lvm="$4";
+    local luks="$5";
+
+    VAI_info_msg "Creating a ${fs} partition on ${dev}";
+
+    # ext
+    if [ "$fs" = "ext2" -o "$fs" = "ext3" -o "$fs" = "ext4" ]; then
+        command="mkfs.${fs} -F"
+        if [ ! -z "$label" ]; then
+            command="$command -L '$label'";
+        fi;
+        eval "$command ${dev}";
+    fi;
+
+    # xfs
+    if [ "$fs" = "xfs" ]; then
+        command="mkfs.xfs -f"
+        if [ ! -z "$label" ]; then
+            command="$command -L '$label'";
+        fi;
+        eval "$command ${dev}";
+    fi
+
+    # fat32
+    if [ "$fs" = "fat" -o "$fs" = "fat32" ]; then
+        command="mkfs.vfat -F32";
+        if [ ! -z "$label" ]; then
+            command="$command -n '$label'";
+        fi;
+        eval "$command ${dev}";
+    fi
+
+    # swap
+    if [ "$fs" = "swap" ]; then
+        mkswap -f "${dev}";
+    fi;
+
+    # lvm
+    if [ "$fs" = "lvm" ]; then
+        has_lvm="1";
+
+        vgcreate -f "${lvm}" "${dev}";
+
+        VAI_lvm_create_pool "${lvm}";
+    fi;
+
+    # luks
+    if [ "$fs" = "luks" ]; then
+        has_luks="1";
+
+        VAI_luks_create_disk "${dev}" "${luks}";
+    fi;
+}
+
+VAI_luks_create_disk() {
+    local dev="$1";
+    local luks="$2";
+    local pass="$(eval "echo \$luks_${luks}_pass")";
+
+    if [ -z "$pass" ]; then
+        cryptsetup luksFormat "${dev}";
+        cryptsetup luksOpen "${dev}" "${luks}";
+    else
+        echo "$pass" | cryptsetup luksFormat -d - "${dev}";
+        echo "$pass" | cryptsetup luksOpen -d - "${dev}" "${luks}";
+        pass="";
+    fi
+
+    VAI_luks_format_partition "${luks}";
+}
+
+VAI_lvm_create_pool() {
+    local pool="$1";
+    local pool_vars="$(set | grep "lvm_${pool}" | awk 'BEGIN {FS="="}; { print $1 };' )";
+    local pool_volumes="$(echo "$pool_vars" | awk 'BEGIN {FS="_"}; { print $4 };' | awk '!x[$0]++')";
+
+    for volume in $pool_volumes
+    do
+        VAI_lvm_create_volume "$pool" "$volume";
+    done
+}
+
+VAI_lvm_create_volume() {
+    local pool="$1";
+    local volume="$2";
+    local size="$(eval "echo \$lvm_${pool}_volume_${volume}_size")";
+
+    lvcreate --name "${volume}" -L "${size}" "${pool}";
+
+    VAI_lvm_format_partition "${pool}" "${volume}";
+}
+
+VAI_luks_format_partition() {
+    local name="$1";
+    local dev="/dev/mapper/${name}";
+    local fs="$(eval "echo \$luks_${name}_fs")";
+    local label="$(eval "echo \$luks_${name}_label")";
+    local luks="$(eval "echo \$luks_${name}_luks")";
+    local lvm="$(eval "echo \$luks_${name}_lvm")";
+
+    VAI_format_partition "$fs" "$dev" "$label" "$lvm" "$luks";
+}
+
+VAI_lvm_format_partition() {
+    local pool="$1";
+    local volume="$2";
+    local dev="/dev/mapper/${pool}-${volume}";
+    local fs="$(eval "echo \$lvm_${pool}_volume_${volume}_fs")";
+    local label="$(eval "echo \$lvm_${pool}_volume_${volume}_label")";
+    local luks="$(eval "echo \$lvm_${pool}_volume_${volume}_luks")";
+    local lvm="$(eval "echo \$lvm_${pool}_volume_${volume}_lvm")";
+
+    VAI_format_partition "$fs" "$dev" "$label" "$luks" "$lvm";
+}
+
+VAI_get_mounts() {
+    local disk_vars="$(set | grep 'disk_' | awk 'BEGIN {FS="="}; { print $1 };' )";
+    local mounts="$(set | grep 'disk_\|lvm_\|luks_' | awk 'BEGIN {FS="="}; { print $1 };' |  grep '_mount$' )";
+    local mount_dev="";
+    local path="";
+    local dev="";
+    local disk="";
+    local partition="";
+    local mount_options="";
+
+    for mount in $mounts
+    do
+        type="$(echo "$mount" | awk 'BEGIN {FS="_"}; { print $1 };')";
+        case "$type" in
+            disk)
+                path="$(eval "echo \$$mount")";
+                disk="$(echo $mount | awk 'BEGIN {FS="_"}; { print $2 };')";
+                partition="$(echo $mount | awk 'BEGIN {FS="_"}; { print $4 };')";
+                fs="$(eval "echo \$disk_${disk}_partition_${partition}_fs")";
+                mount_options="$(eval "echo \$disk_${disk}_partition_${partition}_mount_options")";
+                dev="$(eval "echo \$disk_${disk}_dev")${partition}";
+                mount_dev="${mount_dev}$(echo "$path" | wc -c) $path $dev $fs $mount_options"$'\n';
+                ;;
+            lvm)
+                path="$(eval "echo \$$mount")";
+                pool="$(echo $mount | awk 'BEGIN {FS="_"}; { print $2 };')";
+                volume="$(echo $mount | awk 'BEGIN {FS="_"}; { print $4 };')";
+                fs="$(eval "echo \$lvm_${pool}_volume_${volume}_fs")";\
+                mount_options="$(eval "echo \$lvm_${pool}_volume_${volume}_mount_options")";
+                dev="/dev/mapper/${pool}-${volume}";
+                mount_dev="${mount_dev}$(echo "$path" | wc -c) $path $dev $fs $mount_options"$'\n';
+        esac
+    done
+
+    echo "$mount_dev" | sort -nk1;
 }
 
 VAI_mount_target() {
-    # Mount targetfs
-    mkdir -p "${target}"
-    mount "${disk}3" "${target}"
-    mkdir "${target}/boot"
-    mount "${disk}1" "${target}/boot"
+    local mounts="$(VAI_get_mounts)";
+
+    for dev in $(echo "$mounts" | awk '{print $3}')
+    do
+        path="$(echo "$mounts" | grep "$dev " | awk '{print $2}')";
+
+        if [ "$path" = "swap" ]; then
+            continue;
+        fi
+
+        echo "Mounting '$dev' on '$path'";
+
+        mkdir -p "${target}${path}";
+        mount "$dev" "${target}${path}";
+    done
 }
 
 VAI_install_xbps_keys() {
@@ -62,12 +305,22 @@ VAI_install_xbps_keys() {
 }
 
 VAI_install_base_system() {
+    base_pkgs="base-system grub grub-x86_64-efi grub-i386-efi";
+
+    if [ "$has_lvm" = "1" ]; then
+        base_pkgs="${base_pkgs} lvm2";
+    fi;
+
+    if [ "$has_luks" = "1" ]; then
+        base_pkgs="${base_pkgs} cryptsetup";
+    fi;
+
     # Install a base system
-    XBPS_ARCH="${XBPS_ARCH}" xbps-install -Sy -R "${xbpsrepository}" -r /mnt base-system grub
+    XBPS_ARCH="${XBPS_ARCH}" xbps-install -Sy -R "${xbpsrepository}" -r /mnt $base_pkgs;
 
     # Install additional packages
     if [  -n "${pkgs}" ] ; then
-        XBPS_ARCH="${XBPS_ARCH}" xbps-install -Sy -R "${xbpsrepository}" -r /mnt "${pkgs}"
+        XBPS_ARCH="${XBPS_ARCH}" xbps-install -Sy -R "${xbpsrepository}" -r /mnt $pkgs;
     fi
 }
 
@@ -118,8 +371,19 @@ VAI_configure_grub() {
     # Set hostonly
     echo "hostonly=yes" > "${target}/etc/dracut.conf.d/hostonly.conf"
 
+    if [ "$has_luks" = "1" -o "$has_lvm" = "1" ]; then
+        # add rd.auto=1 to GRUB_CMDLINE_LINUX_DEFAULT
+        sed -i 's:GRUB_CMDLINE_LINUX_DEFAULT="\([^"]\+\)":GRUB_CMDLINE_LINUX_DEFAULT="\1 rd.auto=1":' "${target}/etc/default/grub";
+    fi
+
+    if [ "$has_luks" = "1" ]; then
+        echo "GRUB_ENABLE_CRYPTODISK=y" >> "${target}/etc/default/grub";
+    fi
+
     # Choose the newest kernel
     kernel_version="$(chroot "${target}" xbps-query linux | awk -F "[-_]" '/pkgver/ {print $2}')"
+
+    local disk="$(eval "echo \$disk_${boot_disk}_dev")";
 
     # Install grub
     chroot "${target}" grub-install "${disk}"
@@ -130,17 +394,32 @@ VAI_configure_grub() {
 }
 
 VAI_configure_fstab() {
-    # Grab UUIDs
-    uuid1="$(blkid -s UUID -o value "${disk}1")"
-    uuid2="$(blkid -s UUID -o value "${disk}2")"
-    uuid3="$(blkid -s UUID -o value "${disk}3")"
+    local path="";
+    local dev="";
+    local uuid="";
+    local fs="";
+    local mounts="$(VAI_get_mounts)";
 
-    # Installl UUIDs into /etc/fstab
-    echo "UUID=$uuid3 / ext4 defaults,errors=remount-ro 0 1" >> "${target}/etc/fstab"
-    echo "UUID=$uuid1 /boot ext4 defaults 0 2" >> "${target}/etc/fstab"
-    if [ "${swapsize}" -ne 0 ] ; then
-        echo "UUID=$uuid2 swap swap defaults 0 0" >> "${target}/etc/fstab"
-    fi
+    for dev in $(echo "$mounts" | awk '{print $3}')
+    do
+        path="$(echo "$mounts" | grep "$dev " | awk '{print $2}')";
+        fs="$(echo "$mounts" | grep "$dev " | awk '{print $4}')";
+        options="$(echo "$mounts" | grep "$dev " | awk '{print $5}')";
+        pass="2";
+
+        if [ "$path" = "/" ]; then
+            pass="1";
+        elif [ "$fs" = "swap" ]; then
+            pass="0";
+        fi
+
+        if [ "$fs" = "fat32" -o "$fs" = "fat" ]; then
+            fs="vfat";
+        fi
+
+        uuid="$(blkid -s UUID -o value "${dev}")";
+        echo "UUID=${uuid} ${path} ${fs} ${options:-defaults} 0 ${pass}" >> "${target}/etc/fstab"
+    done
 }
 
 VAI_configure_locale() {
@@ -186,10 +465,8 @@ VAI_end_action() {
 
 VAI_configure_autoinstall() {
     # -------------------------- Setup defaults ---------------------------
-    bootpartitionsize="500M"
-    disk="$(lsblk -ipo NAME,TYPE,MOUNTPOINT | awk '{if ($2=="disk") {disks[$1]=0; last=$1} if ($3=="/") {disks[last]++}} END {for (a in disks) {if(disks[a] == 0){print a; break}}}')"
+    default_disk="$(lsblk -ipo NAME,TYPE,MOUNTPOINT | awk '{if ($2=="disk") {disks[$1]=0; last=$1} if ($3=="/") {disks[last]++}} END {for (a in disks) {if(disks[a] == 0){print a; break}}}')"
     hostname="$(ip -4 -o -r a | awk -F'[ ./]' '{x=$7} END {print x}')"
-    swapsize="$(awk -F"\n" '/MemTotal/ {split($0, b, " "); print b[2] }' /proc/meminfo)";
     target="/mnt"
     timezone="America/Chicago"
     keymap="us"
@@ -197,6 +474,8 @@ VAI_configure_autoinstall() {
     username="voidlinux"
     end_action="shutdown"
     end_script="/bin/true"
+    has_lvm="0";
+    has_luks="0";
 
     XBPS_ARCH="$(xbps-uhelper arch)"
     case $XBPS_ARCH in
@@ -219,13 +498,15 @@ VAI_configure_autoinstall() {
     # Read in the resulting config file which we got via some method
     if [ -f /etc/autoinstall.cfg ] ; then
         VAI_info_msg "Reading configuration file"
-        . ./etc/autoinstall.cfg
+        . /etc/autoinstall.cfg
     fi
 
-    # Bail out if we didn't get a usable disk
-    if [ -z "$disk" ] ; then
-        die "No valid disk!"
-    fi
+    cat <<_EOF > /etc/lvm/lvm.conf
+global {
+    locking_type = 1
+    use_lvmetad = 0
+}
+_EOF
 }
 
 VAI_main() {
@@ -240,9 +521,8 @@ VAI_main() {
     VAI_print_step "Configuring installer"
     VAI_configure_autoinstall
 
-    VAI_print_step "Configuring disk using scheme 'Atomic'"
-    VAI_partition_disk
-    VAI_format_disk
+    VAI_print_step "Configuring disk using recipe defined in config"
+    VAI_partition_disks
 
     VAI_print_step "Mounting the target filesystems"
     VAI_mount_target

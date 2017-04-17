@@ -13,20 +13,29 @@ depends() {
 install() {
     inst /usr/bin/awk
     inst /usr/bin/chmod
+    inst /usr/bin/chpasswd
     inst /usr/bin/chroot
     inst /usr/bin/clear
     inst /usr/bin/cp
-    inst /usr/bin/chpasswd
+    inst /usr/bin/cryptsetup
     inst /usr/bin/dhcpcd
     inst /usr/bin/halt
     inst /usr/bin/install
     inst /usr/bin/lsblk
+    inst /usr/bin/lvcreate
     inst /usr/bin/mkdir
     inst /usr/bin/mkfs.ext4
+    inst /usr/bin/mkfs.xfs
+    inst /usr/bin/mkfs.vfat
     inst /usr/bin/mkswap
     inst /usr/bin/mount
+    inst /usr/bin/sed
     inst /usr/bin/sfdisk
+    inst /usr/bin/sort
     inst /usr/bin/sync
+    inst /usr/bin/uniq
+    inst /usr/bin/vgcreate
+    inst /usr/bin/wc
     inst /usr/bin/xbps-install
     inst /usr/bin/xbps-uhelper
     inst /usr/bin/xbps-query
