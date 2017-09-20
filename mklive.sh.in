@@ -29,41 +29,28 @@
 trap 'error_out $? $LINENO' INT TERM 0
 umask 022
 
+# This source pulls in all the functions from lib.sh.  This set of
+# functions makes it much easier to work with chroots and abstracts
+# away all the problems with running binaries with QEMU.
+# shellcheck source=./lib.sh
+. ./lib.sh
+
+REQTOOLS="xorisso truncate"
+
+# Die is a function provided in lib.sh which handles the cleanup of
+# the mounts and removal of temporary directories if the running
+# program exists unexpectedly.
+trap 'die "Interrupted! exiting..."' INT TERM HUP
+
+# These are the packages that are required across all images
 readonly REQUIRED_PKGS="base-files libgcc dash coreutils sed tar gawk syslinux grub-i386-efi grub-x86_64-efi squashfs-tools xorriso"
 readonly INITRAMFS_PKGS="binutils xz device-mapper dhclient dracut-network"
 readonly PROGNAME=$(basename $0)
-
-info_msg() {
-    printf "\033[1m$@\n\033[m"
-}
-die() {
-    info_msg "ERROR: $@"
-    error_out 1 $LINENO
-}
-print_step() {
-    CURRENT_STEP=$((CURRENT_STEP+1))
-    info_msg "[${CURRENT_STEP}/${STEP_COUNT}] $@"
-}
-mount_pseudofs() {
-    for f in sys dev proc; do
-        mkdir -p $ROOTFS/$f
-        mount --bind /$f $ROOTFS/$f
-    done
-}
-umount_pseudofs() {
-    umount -f $ROOTFS/sys >/dev/null 2>&1
-    umount -f $ROOTFS/dev >/dev/null 2>&1
-    umount -f $ROOTFS/proc >/dev/null 2>&1
-}
-error_out() {
-    umount_pseudofs
-    [ -d "$BUILDDIR" -a -z "$KEEP_BUILDDIR" ] && rm -rf "$BUILDDIR"
-    exit ${1:=0}
-}
+readonly CURDIR="$PWD"
 
 usage() {
     cat <<_EOF
-Usage: $PROGNAME [options]
+Usage: $PROGNAME [options] <rootfs>
 
 Options:
  -a <xbps-arch>     Set XBPS_ARCH (do not use it unless you know what it is)
@@ -89,220 +76,12 @@ _EOF
     exit 1
 }
 
-copy_void_keys() {
-    mkdir -p "$1"/var/db/xbps/keys
-    cp keys/*.plist "$1"/var/db/xbps/keys
-}
-
-copy_void_conf() {
-    install -Dm644 data/void-vpkgs.conf "$1"/usr/share/xbps.d/void-virtualpkgs.conf
-}
-
-copy_dracut_files() {
-    mkdir -p $1/usr/lib/dracut/modules.d/01vmklive
-    cp dracut/vmklive/* $1/usr/lib/dracut/modules.d/01vmklive/
-}
-
-copy_autoinstaller_files() {
-    mkdir -p $1/usr/lib/dracut/modules.d/01autoinstaller
-    cp dracut/autoinstaller/* $1/usr/lib/dracut/modules.d/01autoinstaller/
-}
-
-install_prereqs() {
-    copy_void_conf $VOIDHOSTDIR
-    XBPS_ARCH=$ARCH $XBPS_INSTALL_CMD -r $VOIDHOSTDIR $XBPS_REPOSITORY \
-        $XBPS_HOST_CACHEDIR -y ${REQUIRED_PKGS}
-    [ $? -ne 0 ] && die "Failed to install required software, exiting..."
-}
-
-install_packages() {
-    copy_void_conf $ROOTFS
-
-    XBPS_ARCH=$BASE_ARCH ${XBPS_INSTALL_CMD} -r $ROOTFS \
-        $XBPS_REPOSITORY $XBPS_CACHEDIR -yn ${PACKAGE_LIST} ${INITRAMFS_PKGS}
-    [ $? -ne 0 ] && die "Missing required binary packages, exiting..."
-
-    mount_pseudofs
-
-    LANG=C XBPS_ARCH=$BASE_ARCH ${XBPS_INSTALL_CMD} -U -r $ROOTFS \
-        $XBPS_REPOSITORY $XBPS_CACHEDIR -y ${PACKAGE_LIST} ${INITRAMFS_PKGS}
-    [ $? -ne 0 ] && die "Failed to install $PACKAGE_LIST"
-
-    xbps-reconfigure -r $ROOTFS -f base-files >/dev/null 2>&1
-    chroot $ROOTFS env -i xbps-reconfigure -f base-files
-
-    # Enable choosen UTF-8 locale and generate it into the target rootfs.
-    if [ -f $ROOTFS/etc/default/libc-locales ]; then
-        sed -e "s/\#\(${LOCALE}.*\)/\1/g" -i $ROOTFS/etc/default/libc-locales
-    fi
-    chroot $ROOTFS env -i xbps-reconfigure -a
-
-    if [ -x installer.sh ]; then
-        install -Dm755 installer.sh $ROOTFS/usr/sbin/void-installer
-    else
-        install -Dm755 /usr/sbin/void-installer $ROOTFS/usr/sbin/void-installer
-    fi
-    # Cleanup and remove useless stuff.
-    rm -rf $ROOTFS/var/cache/* $ROOTFS/run/* $ROOTFS/var/run/*
-}
-
-copy_include_directory() {
-    find $INCLUDE_DIRECTORY -mindepth 1 -maxdepth 1 -exec cp -rfpPv {} $ROOTFS/ \;
-}
-
-generate_initramfs() {
-    local _args
-
-    copy_dracut_files $ROOTFS
-    copy_autoinstaller_files $ROOTFS
-    if [ "$BASE_SYSTEM_PKG" = "base-system-systemd" ]; then
-        _args="--add systemd"
-    else
-        _args="--omit systemd"
-    fi
-    chroot $ROOTFS env -i /usr/bin/dracut -N --${INITRAMFS_COMPRESSION} \
-        --add-drivers "ahci" --force-add "vmklive autoinstaller" ${_args} "/boot/initrd" $KERNELVERSION
-    [ $? -ne 0 ] && die "Failed to generate the initramfs"
-
-    mv $ROOTFS/boot/initrd $BOOT_DIR
-    cp $ROOTFS/boot/vmlinuz-$KERNELVERSION $BOOT_DIR/vmlinuz
-}
-
-cleanup_rootfs() {
-    for f in ${INITRAMFS_PKGS}; do
-        revdeps=$(xbps-query -r $ROOTFS -X $f)
-        if [ -n "$revdeps" ]; then
-            xbps-pkgdb -r $ROOTFS -m auto $f
-        else
-            xbps-remove -r $ROOTFS -Ry ${f} >/dev/null 2>&1
-        fi
-    done
-    rm -r $ROOTFS/usr/lib/dracut/modules.d/01vmklive
-    rm -r $ROOTFS/usr/lib/dracut/modules.d/01autoinstaller
-}
-
-generate_isolinux_boot() {
-    cp -f $SYSLINUX_DATADIR/isolinux.bin "$ISOLINUX_DIR"
-    cp -f $SYSLINUX_DATADIR/ldlinux.c32 "$ISOLINUX_DIR"
-    cp -f $SYSLINUX_DATADIR/libcom32.c32 "$ISOLINUX_DIR"
-    cp -f $SYSLINUX_DATADIR/vesamenu.c32 "$ISOLINUX_DIR"
-    cp -f $SYSLINUX_DATADIR/libutil.c32 "$ISOLINUX_DIR"
-    cp -f $SYSLINUX_DATADIR/chain.c32 "$ISOLINUX_DIR"
-    cp -f isolinux/isolinux.cfg.in "$ISOLINUX_DIR"/isolinux.cfg
-    cp -f ${SPLASH_IMAGE} "$ISOLINUX_DIR"
-
-    sed -i  -e "s|@@SPLASHIMAGE@@|$(basename ${SPLASH_IMAGE})|" \
-        -e "s|@@KERNVER@@|${KERNELVERSION}|" \
-        -e "s|@@KEYMAP@@|${KEYMAP}|" \
-        -e "s|@@ARCH@@|$BASE_ARCH|" \
-        -e "s|@@LOCALE@@|${LOCALE}|" \
-        -e "s|@@BOOT_TITLE@@|${BOOT_TITLE}|" \
-        -e "s|@@BOOT_CMDLINE@@|${BOOT_CMDLINE}|" \
-        $ISOLINUX_DIR/isolinux.cfg
-}
-
-generate_grub_efi_boot() {
-    cp -f grub/grub.cfg $GRUB_DIR
-    cp -f grub/grub_void.cfg.in $GRUB_DIR/grub_void.cfg
-    sed -i  -e "s|@@SPLASHIMAGE@@|$(basename ${SPLASH_IMAGE})|" \
-        -e "s|@@KERNVER@@|${KERNELVERSION}|" \
-        -e "s|@@KEYMAP@@|${KEYMAP}|" \
-        -e "s|@@ARCH@@|$BASE_ARCH|" \
-        -e "s|@@BOOT_TITLE@@|${BOOT_TITLE}|" \
-        -e "s|@@BOOT_CMDLINE@@|${BOOT_CMDLINE}|" \
-        -e "s|@@LOCALE@@|${LOCALE}|" $GRUB_DIR/grub_void.cfg
-    mkdir -p $GRUB_DIR/fonts
-    cp -f $GRUB_DATADIR/unicode.pf2 $GRUB_DIR/fonts
-
-    modprobe -q loop || :
-
-    # Create EFI vfat image.
-    truncate -s 32M $GRUB_DIR/efiboot.img >/dev/null 2>&1
-    mkfs.vfat -F12 -S 512 -n "grub_uefi" "$GRUB_DIR/efiboot.img" >/dev/null 2>&1
-
-    GRUB_EFI_TMPDIR="$(mktemp --tmpdir=$HOME -d)"
-    LOOP_DEVICE="$(losetup --show --find ${GRUB_DIR}/efiboot.img)"
-    mount -o rw,flush -t vfat "${LOOP_DEVICE}" "${GRUB_EFI_TMPDIR}" >/dev/null 2>&1
-
-    cp -a $IMAGEDIR/boot $VOIDHOSTDIR
-    xbps-uchroot $VOIDHOSTDIR grub-mkstandalone -- \
-		 --directory="/usr/lib/grub/i386-efi" \
-		 --format="i386-efi" \
-		 --output="/tmp/bootia32.efi" \
-		 "boot/grub/grub.cfg"
-    if [ $? -ne 0 ]; then
-        umount "$GRUB_EFI_TMPDIR"
-        losetup --detach "${LOOP_DEVICE}"
-        die "Failed to generate EFI loader"
-    fi
-    mkdir -p ${GRUB_EFI_TMPDIR}/EFI/BOOT
-    cp -f $VOIDHOSTDIR/tmp/bootia32.efi ${GRUB_EFI_TMPDIR}/EFI/BOOT/BOOTIA32.EFI
-    xbps-uchroot $VOIDHOSTDIR grub-mkstandalone -- \
-		 --directory="/usr/lib/grub/x86_64-efi" \
-		 --format="x86_64-efi" \
-		 --output="/tmp/bootx64.efi" \
-		 "boot/grub/grub.cfg"
-    if [ $? -ne 0 ]; then
-        umount "$GRUB_EFI_TMPDIR"
-        losetup --detach "${LOOP_DEVICE}"
-        die "Failed to generate EFI loader"
-    fi
-    cp -f $VOIDHOSTDIR/tmp/bootx64.efi ${GRUB_EFI_TMPDIR}/EFI/BOOT/BOOTX64.EFI
-    umount "$GRUB_EFI_TMPDIR"
-    losetup --detach "${LOOP_DEVICE}"
-    rm -rf $GRUB_EFI_TMPDIR
-}
-
-generate_squashfs() {
-    umount_pseudofs
-
-    # Find out required size for the rootfs and create an ext3fs image off it.
-    ROOTFS_SIZE=$(du -sm "$ROOTFS"|awk '{print $1}')
-    if [ -z "$ROOTFS_FREESIZE" ]; then
-        ROOTFS_FREESIZE="$((ROOTFS_SIZE/6))"
-    fi
-    mkdir -p "$BUILDDIR/tmp/LiveOS"
-    truncate -s "$((ROOTFS_SIZE+ROOTFS_FREESIZE))M" \
-	    $BUILDDIR/tmp/LiveOS/ext3fs.img >/dev/null 2>&1
-    mkdir -p "$BUILDDIR/tmp-rootfs"
-    mkfs.ext3 -F -m1 "$BUILDDIR/tmp/LiveOS/ext3fs.img" >/dev/null 2>&1
-    mount -o loop "$BUILDDIR/tmp/LiveOS/ext3fs.img" "$BUILDDIR/tmp-rootfs"
-    cp -a $ROOTFS/* $BUILDDIR/tmp-rootfs/
-    umount -f "$BUILDDIR/tmp-rootfs"
-    mkdir -p "$IMAGEDIR/LiveOS"
-
-    $VOIDHOSTDIR/usr/bin/mksquashfs "$BUILDDIR/tmp" "$IMAGEDIR/LiveOS/squashfs.img" \
-        -comp ${SQUASHFS_COMPRESSION} || die "Failed to generate squashfs image"
-    chmod 444 "$IMAGEDIR/LiveOS/squashfs.img"
-
-    # Remove rootfs and temporary dirs, we don't need them anymore.
-    rm -rf "$ROOTFS" "$BUILDDIR/tmp-rootfs" "$BUILDDIR/tmp"
-}
-
-generate_iso_image() {
-    $VOIDHOSTDIR/usr/bin/xorriso -as mkisofs \
-        -iso-level 3 -rock -joliet \
-        -max-iso9660-filenames -omit-period \
-        -omit-version-number -relaxed-filenames -allow-lowercase \
-        -volid "VOID_LIVE" \
-        -eltorito-boot boot/isolinux/isolinux.bin \
-        -eltorito-catalog boot/isolinux/boot.cat \
-        -no-emul-boot -boot-load-size 4 -boot-info-table \
-        -eltorito-alt-boot -e boot/grub/efiboot.img -isohybrid-gpt-basdat -no-emul-boot \
-        -isohybrid-mbr $SYSLINUX_DATADIR/isohdpfx.bin \
-        -output "$CURDIR/$OUTPUT_FILE" "$IMAGEDIR" || die "Failed to generate ISO image"
-}
-
-#
-# main()
-#
 while getopts "a:b:r:c:C:T:Kk:l:i:I:s:S:o:p:h" opt; do
     case $opt in
         a) BASE_ARCH="$OPTARG";;
         b) BASE_SYSTEM_PKG="$OPTARG";;
         r) XBPS_REPOSITORY="--repository=$OPTARG $XBPS_REPOSITORY";;
         c) XBPS_CACHEDIR="--cachedir=$OPTARG";;
-        K) readonly KEEP_BUILDDIR=1;;
         k) KEYMAP="$OPTARG";;
         l) LOCALE="$OPTARG";;
         i) INITRAMFS_COMPRESSION="$OPTARG";;
@@ -317,38 +96,26 @@ while getopts "a:b:r:c:C:T:Kk:l:i:I:s:S:o:p:h" opt; do
     esac
 done
 shift $((OPTIND - 1))
+BASE_TARBALL="$1"
 
-XBPS_REPOSITORY="$XBPS_REPOSITORY --repository=http://repo.voidlinux.eu/current --repository=http://muslrepo.voidlinux.eu/current"
-
-ARCH=$(xbps-uhelper arch)
+# We need to infer the target architecture from the filename.  All
+# other scripts are able to get this from the platforms map because a
+# platform is manually specified.
+XBPS_TARGET_ARCH=${BASE_TARBALL%%-ROOTFS*}
+XBPS_TARGET_ARCH=${XBPS_TARGET_ARCH##void-}
 
 # Set defaults
-: ${BASE_ARCH:=$(xbps-uhelper arch 2>/dev/null || uname -m)}
-: ${XBPS_CACHEDIR:=-c $(pwd -P)/xbps-cachedir-${BASE_ARCH}}
-: ${XBPS_HOST_CACHEDIR:=-c $(pwd -P)/xbps-cachedir-${ARCH}}
 : ${KEYMAP:=us}
 : ${LOCALE:=en_US.UTF-8}
 : ${INITRAMFS_COMPRESSION:=xz}
 : ${SQUASHFS_COMPRESSION:=xz}
 : ${BASE_SYSTEM_PKG:=base-system}
 : ${BOOT_TITLE:="Void Linux"}
+: ${SPLASH_IMAGE:=data/splash.png}
 
 # Required packages in the image for a working system.
 PACKAGE_LIST="$BASE_SYSTEM_PKG $PACKAGE_LIST"
 
-# Check for root permissions.
-if [ "$(id -u)" -ne 0 ]; then
-    die "Must be run as root, exiting..."
-fi
-
-readonly CURDIR="$PWD"
-
-ISO_VOLUME="VOID_LIVE"
-if [ -n "$ROOTDIR" ]; then
-    BUILDDIR=$(mktemp --tmpdir="$ROOTDIR" -d)
-else
-    BUILDDIR=$(mktemp --tmpdir="$(pwd -P)" -d)
-fi
 BUILDDIR=$(readlink -f $BUILDDIR)
 IMAGEDIR="$BUILDDIR/image"
 ROOTFS="$IMAGEDIR/rootfs"
@@ -356,67 +123,247 @@ VOIDHOSTDIR="$BUILDDIR/void-host"
 BOOT_DIR="$IMAGEDIR/boot"
 ISOLINUX_DIR="$BOOT_DIR/isolinux"
 GRUB_DIR="$BOOT_DIR/grub"
-ISOLINUX_CFG="$ISOLINUX_DIR/isolinux.cfg"
-CURRENT_STEP=0
-STEP_COUNT=9
-[ -n "${INCLUDE_DIRECTORY}" ] && ((STEP_COUNT=STEP_COUNT+1))
 
 : ${SYSLINUX_DATADIR:=$VOIDHOSTDIR/usr/share/syslinux}
 : ${GRUB_DATADIR:=$VOIDHOSTDIR/usr/share/grub}
-: ${SPLASH_IMAGE:=data/splash.png}
-: ${XBPS_INSTALL_CMD:=xbps-install}
-: ${XBPS_REMOVE_CMD:=xbps-remove}
-: ${XBPS_QUERY_CMD:=xbps-query}
-: ${XBPS_RINDEX_CMD:=xbps-rindex}
-: ${XBPS_UHELPER_CMD:=xbps-uhelper}
-: ${XBPS_RECONFIGURE_CMD:=xbps-reconfigure}
-
-mkdir -p $ROOTFS $VOIDHOSTDIR $ISOLINUX_DIR $GRUB_DIR
-
-print_step "Synchronizing XBPS repository data..."
-copy_void_keys $ROOTFS
-copy_void_keys $VOIDHOSTDIR
-XBPS_ARCH=$BASE_ARCH $XBPS_INSTALL_CMD -r $ROOTFS ${XBPS_REPOSITORY} -S
-XBPS_ARCH=$ARCH $XBPS_INSTALL_CMD -r $VOIDHOSTDIR $XBPS_REPOSITORY -S
-
-_linux_series=$(XBPS_ARCH=$BASE_ARCH $XBPS_QUERY_CMD -r $ROOTFS ${XBPS_REPOSITORY:=-R} -x linux|head -1)
-_kver=$(XBPS_ARCH=$BASE_ARCH $XBPS_QUERY_CMD -r $ROOTFS ${XBPS_REPOSITORY:=-R} -p pkgver ${_linux_series})
-KERNELVERSION=$($XBPS_UHELPER_CMD getpkgversion ${_kver})
 
 : ${OUTPUT_FILE="void-live-${BASE_ARCH}-${KERNELVERSION}-$(date +%Y%m%d).iso"}
 
-print_step "Installing software to generate the image: ${REQUIRED_PKGS} ..."
-install_prereqs
 
-mkdir -p "$ROOTFS"/etc
-[ -s data/motd ] && cp data/motd $ROOTFS/etc
-[ -s data/issue ] && cp data/issue $ROOTFS/etc
+# At this point we shall set the cachedir to speed up the builds
+set_cachedir
 
-print_step "Installing void pkgs into the rootfs: ${PACKAGE_LIST} ..."
-install_packages
+# Before going any further, check that the tools that are needed are
+# present.  If we delayed this we could check for the QEMU binary, but
+# its a reasonable tradeoff to just bail out now.
+check_tools
 
-if [ -n "${INCLUDE_DIRECTORY}" ];then
-    print_step "Copying directory structure into the rootfs: ${INCLUDE_DIRECTORY} ..."
-    copy_include_directory
+# We need to operate on a tempdir, if this fails to create, it is
+# absolutely crucial to bail out so that we don't hose the system that
+# is running the script.
+ROOTFS=$(mktemp -d) || die "failed to create ROOTFS tempdir, exiting..."
+BOOT_DIR=$(mktemp -d) || die "failed to create BOOT_DIR tempdir, exiting..."
+
+# Install all the required packages for this image.  This will include
+# at the minimum the packages needed for the base system to boot, but
+# in practice usually also includes a desktop environment and some
+# other stuff.
+info_msg "Expanding base tarball $BASE_TARBALL into $ROOTFS for $PLATFORM build."
+tar xf "$BASE_TARBALL" -C "$ROOTFS"
+
+# Option splitting is explicitly required here
+# shellcheck disable=SC2086 
+run_cmd_target xbps-install -r "$ROOTFS" "$XBPS_REPOSITORY" "$XBPS_CACHEDIR" -y -U ${PACKAGE_LIST} ${INITRAMFS_PKGS}
+[ $? -ne 0 ] && die "Failed to install $PACKAGE_LIST"
+
+# Enable choosen UTF-8 locale and generate it into the target rootfs.
+# This step will only be run on systems using glibc as muslc does not
+# support this locale mechanism.
+if [ -f "$ROOTFS/etc/default/libc-locales" ]; then
+    sed -e "s/\#\(${LOCALE}.*\)/\1/g" -i "$ROOTFS/etc/default/libc-locales"
 fi
 
-print_step "Generating initramfs image ($INITRAMFS_COMPRESSION)..."
-generate_initramfs
+# At this point all of the executables are installed, we'll go ahead
+# and configure anything that remains and keep on moving.
+run_cmd_chroot "$ROOTFS" "env -i xbps-reconfigure -a"
 
-print_step "Generating isolinux support for PC-BIOS systems..."
-generate_isolinux_boot
+# Primarily the live media is used to run the system install.  Thus we
+# install the installer so that it can install the system later.
+install -Dm755 installer.sh "$ROOTFS/usr/sbin/void-installer"
 
-print_step "Generating GRUB support for EFI systems..."
-generate_grub_efi_boot
+# The live media has a hard-coded password set and some special sudo
+# configuration.  This is clearly documented in the project
+# documentation, but to try and cut down on the number of support
+# requests, we put the information into the motd and issue file that
+# are displayed at startup.
+[ -s data/motd ] && cp data/motd "$ROOTFS/etc"
+[ -s data/issue ] && cp data/issue "$ROOTFS/etc"
 
-print_step "Cleaning up rootfs..."
-cleanup_rootfs
+# The live media uses a pair of special dracut modules to do the magic
+# of a live system.  The first one 'vmklive' handles all the boot time
+# service configuration that needs to be dynamic outside of the
+# squashfs as well as setting up the users and passwords on the
+# system.  If this module fails to install the rest of the system
+# won't really be usable since there won't be any users on it.
+mkdir -p "$ROOTFS/usr/lib/dracut/modules.d/01vmklive"
+cp dracut/vmklive/* "$ROOTFS/usr/lib/dracut/modules.d/01vmklive/"
 
-print_step "Generating squashfs image ($SQUASHFS_COMPRESSION) from rootfs..."
-generate_squashfs
+# The second module is the autoinstaller.  This is built as a dracut
+# module so that it can also be used in the netboot tarballs without
+# modification.  It also has the convenient side effect that if you
+# are burning custom media you can invoke the autoinstaller with a
+# kernel cmdline argument which will override the normal system boot.
+mkdir -p "$ROOTFS/usr/lib/dracut/modules.d/01autoinstaller"
+cp dracut/autoinstaller/* "$ROOTFS/usr/lib/dracut/modules.d/01autoinstaller/"
 
-print_step "Generating ISO image..."
-generate_iso_image
+# Dracut needs to know the kernel version that will be using this
+# initrd so that it can install the kernel drivers in it.  Normally
+# this check is quite complex, but since this is a clean rootfs and we
+# just installed exactly one kernel, this check can get by with a
+# really niave command to figure out the kernel version
+KERNELVERSION=$(ls "$ROOTFS/usr/lib/modules/")
 
-hsize=$(du -sh "$CURDIR/$OUTPUT_FILE"|awk '{print $1}')
-info_msg "Created $(readlink -f $CURDIR/$OUTPUT_FILE) ($hsize) successfully."
+# Now that things are setup, its time to build the initrd.  This is
+# slightly different from the way that normal initrd's are built by
+# dracut since we force the installation of vmklive and autoinstaller
+# as no module depends on them.
+run_cmd_chroot "$ROOTFS" "env -i /usr/bin/dracut \
+               -N \
+               --${INITRAMFS_COMPRESSION} \
+               --add-drivers ahci \
+               --force-add 'vmklive autoinstaller' \
+                --omit systemd \
+                /boot/initrd \
+                $KERNELVERSION"
+[ $? -ne 0 ] && die "Failed to generate the initramfs"
+
+# All of / lives on a squashfs, this isn't directly bootable and so
+# the initrd needs to live outside of it.  This is why the $BOOT_DIR
+# is an explicitly seperate directory.
+mv "$ROOTFS/boot/initrd" "$BOOT_DIR"
+cp "$ROOTFS/boot/vmlinuz-$KERNELVERSION" "$BOOT_DIR/vmlinuz"
+
+# The rootfs needs to stay clean, we can't leave these modules lying
+# around.  First of all they serve no purpose in the installed system,
+# and second the autoinstaller can wipe the disk with no confirmation
+# if the right "magic" parameters are present.
+rm -r "$ROOTFS/usr/lib/dracut/modules.d/01vmklive"
+rm -r "$ROOTFS/usr/lib/dracut/modules.d/01autoinstaller"
+
+# To provide some mechanism for customization, the live disks accept a
+# directory to be overlayed into the rootfs.  This can be used to
+# include configuration data or to otherwise customize the system in
+# some way.
+if [ -n "${INCLUDE_DIRECTORY}" ];then
+    print_step "Copying directory structure into the rootfs: ${INCLUDE_DIRECTORY} ..."
+    find "$INCLUDE_DIRECTORY" -mindepth 1 -maxdepth 1 -exec cp -rfpPv {} "$ROOTFS/" \;
+fi
+
+# Cleanup and remove useless stuff.
+rm -rf $ROOTFS/var/cache/* $ROOTFS/run/* $ROOTFS/var/run/*
+
+# What follows from here are the steps needed to make the system
+# bootable.  This is very complex because it needs to boot on
+# *everything*.  Its capable of of booting up on i686, x86_64, both in
+# BIOS and EFI and even less obviously, in hybrid architectural modes.
+# This is particularly useful on some Intel platforms that boot in
+# 32-bit mode and can only switch to 64-bit mode after the kernel is
+# loaded.
+
+# First the syslinux config needs to be pulled over for standard
+# booting from a CD-ROM, this will also mostly work on a flash drive,
+# but that is more magic in syslinux than anything we do here.
+cp -f "$SYSLINUX_DATADIR/isolinux.bin" "$ISOLINUX_DIR"
+cp -f "$SYSLINUX_DATADIR/ldlinux.c32" "$ISOLINUX_DIR"
+cp -f "$SYSLINUX_DATADIR/libcom32.c32" "$ISOLINUX_DIR"
+cp -f "$SYSLINUX_DATADIR/vesamenu.c32" "$ISOLINUX_DIR"
+cp -f "$SYSLINUX_DATADIR/libutil.c32" "$ISOLINUX_DIR"
+cp -f "$SYSLINUX_DATADIR/chain.c32" "$ISOLINUX_DIR"
+cp -f isolinux/isolinux.cfg.in "$ISOLINUX_DIR"/isolinux.cfg
+cp -f ${SPLASH_IMAGE} "$ISOLINUX_DIR"
+
+sed -i  -e "s|@@SPLASHIMAGE@@|$(basename ${SPLASH_IMAGE})|" \
+    -e "s|@@KERNVER@@|${KERNELVERSION}|" \
+    -e "s|@@KEYMAP@@|${KEYMAP}|" \
+    -e "s|@@ARCH@@|$BASE_ARCH|" \
+    -e "s|@@LOCALE@@|${LOCALE}|" \
+    -e "s|@@BOOT_TITLE@@|${BOOT_TITLE}|" \
+    -e "s|@@BOOT_CMDLINE@@|${BOOT_CMDLINE}|" \
+    "$ISOLINUX_DIR/isolinux.cfg"
+
+
+# Now we setup the grub configuration.  This is used by the EFI boot
+# stubs below.
+cp -f grub/grub.cfg "$GRUB_DIR"
+cp -f grub/grub_void.cfg.in "$GRUB_DIR/grub_void.cfg"
+sed -i  -e "s|@@SPLASHIMAGE@@|$(basename ${SPLASH_IMAGE})|" \
+    -e "s|@@KERNVER@@|${KERNELVERSION}|" \
+    -e "s|@@KEYMAP@@|${KEYMAP}|" \
+    -e "s|@@ARCH@@|$BASE_ARCH|" \
+    -e "s|@@BOOT_TITLE@@|${BOOT_TITLE}|" \
+    -e "s|@@BOOT_CMDLINE@@|${BOOT_CMDLINE}|" \
+    -e "s|@@LOCALE@@|${LOCALE}|" "$GRUB_DIR/grub_void.cfg"
+mkdir -p "$GRUB_DIR/fonts"
+cp -f "$GRUB_DATADIR/unicode.pf2" "$GRUB_DIR/fonts"
+
+# This next bit is pretty special, we need to build a boot filesystem
+# on a loop device which will then become integrated into the ISO
+# container later.  This only works if the loop driver is available
+# though.
+modprobe -q loop
+
+# Create EFI vfat image.
+truncate -s 32M "$GRUB_DIR/efiboot.img" >/dev/null 2>&1
+mkfs.vfat -F12 -S 512 -n "grub_uefi" "$GRUB_DIR/efiboot.img" >/dev/null 2>&1
+
+# Making the boot partition requires a loop mounted filesystem since
+# the grub tools expect to operate on a disk, not a directory.  This
+# has the risk that if it doesn't dismount cleanly it could leave the
+# system in a dirty state, but it is very unlikely this could fail.
+GRUB_EFI_TMPDIR="$(mktemp -d)"
+LOOP_DEVICE="$(losetup --show --find "${GRUB_DIR}/efiboot.img")"
+mount -o rw,flush -t vfat "${LOOP_DEVICE}" "${GRUB_EFI_TMPDIR}" >/dev/null 2>&1
+
+cp -a "$IMAGEDIR/boot" $VOIDHOSTDIR
+xbps-uchroot $VOIDHOSTDIR grub-mkstandalone -- \
+	     --directory="/usr/lib/grub/i386-efi" \
+	     --format="i386-efi" \
+	     --output="/tmp/bootia32.efi" \
+	     "boot/grub/grub.cfg"
+if [ $? -ne 0 ]; then
+    umount "$GRUB_EFI_TMPDIR"
+    losetup --detach "${LOOP_DEVICE}"
+    die "Failed to generate EFI loader"
+fi
+mkdir -p ${GRUB_EFI_TMPDIR}/EFI/BOOT
+cp -f $VOIDHOSTDIR/tmp/bootia32.efi ${GRUB_EFI_TMPDIR}/EFI/BOOT/BOOTIA32.EFI
+xbps-uchroot $VOIDHOSTDIR grub-mkstandalone -- \
+	     --directory="/usr/lib/grub/x86_64-efi" \
+	     --format="x86_64-efi" \
+	     --output="/tmp/bootx64.efi" \
+	     "boot/grub/grub.cfg"
+if [ $? -ne 0 ]; then
+    umount "$GRUB_EFI_TMPDIR"
+    losetup --detach "${LOOP_DEVICE}"
+    die "Failed to generate EFI loader"
+fi
+cp -f $VOIDHOSTDIR/tmp/bootx64.efi ${GRUB_EFI_TMPDIR}/EFI/BOOT/BOOTX64.EFI
+umount "$GRUB_EFI_TMPDIR"
+losetup --detach "${LOOP_DEVICE}"
+rm -rf $GRUB_EFI_TMPDIR
+
+
+# Find out required size for the rootfs and create an ext3fs image off it.
+ROOTFS_SIZE=$(du -sm "$ROOTFS"|awk '{print $1}')
+if [ -z "$ROOTFS_FREESIZE" ]; then
+    ROOTFS_FREESIZE="$((ROOTFS_SIZE/6))"
+fi
+mkdir -p "$BUILDDIR/tmp/LiveOS"
+truncate -s "$((ROOTFS_SIZE+ROOTFS_FREESIZE))M" \
+	 $BUILDDIR/tmp/LiveOS/ext3fs.img >/dev/null 2>&1
+mkdir -p "$BUILDDIR/tmp-rootfs"
+mkfs.ext3 -F -m1 "$BUILDDIR/tmp/LiveOS/ext3fs.img" >/dev/null 2>&1
+mount -o loop "$BUILDDIR/tmp/LiveOS/ext3fs.img" "$BUILDDIR/tmp-rootfs"
+cp -a $ROOTFS/* $BUILDDIR/tmp-rootfs/
+umount -f "$BUILDDIR/tmp-rootfs"
+mkdir -p "$IMAGEDIR/LiveOS"
+
+mksquashfs "$BUILDDIR/tmp" "$IMAGEDIR/LiveOS/squashfs.img" \
+                                -comp ${SQUASHFS_COMPRESSION} || die "Failed to generate squashfs image"
+chmod 444 "$IMAGEDIR/LiveOS/squashfs.img"
+
+# Remove rootfs and temporary dirs, we don't need them anymore.
+rm -rf "$ROOTFS" "$BUILDDIR/tmp-rootfs" "$BUILDDIR/tmp"
+
+xorriso -as mkisofs \
+                             -iso-level 3 -rock -joliet \
+                             -max-iso9660-filenames -omit-period \
+                             -omit-version-number -relaxed-filenames -allow-lowercase \
+                             -volid "VOID_LIVE" \
+                             -eltorito-boot boot/isolinux/isolinux.bin \
+                             -eltorito-catalog boot/isolinux/boot.cat \
+                             -no-emul-boot -boot-load-size 4 -boot-info-table \
+                             -eltorito-alt-boot -e boot/grub/efiboot.img -isohybrid-gpt-basdat -no-emul-boot \
+                             -isohybrid-mbr $SYSLINUX_DATADIR/isohdpfx.bin \
+                             -output "$CURDIR/$OUTPUT_FILE" "$IMAGEDIR" || die "Failed to generate ISO image"
+
